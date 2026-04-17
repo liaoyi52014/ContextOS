@@ -1,0 +1,81 @@
+server:
+  url: http://localhost:9999
+  port: 9999
+  development_mode: false
+
+admin:
+  # First startup will bootstrap this admin user if it does not exist.
+  bootstrap_username: admin
+  bootstrap_password: change-me
+  # REPL uses these credentials for auto-login against the HTTP API.
+  username: admin
+  password: change-me
+
+redis:
+  mode: standalone
+  addr: 172.20.156.41:6378
+  #password: ""
+  db: 0
+  # Sentinel mode example:
+  # sentinel_addrs: ["127.0.0.1:26379"]
+  # sentinel_master: mymaster
+  # sentinel_password: ""
+  # Cluster mode example:
+  # cluster_addrs: ["127.0.0.1:7000", "127.0.0.1:7001", "127.0.0.1:7002"]
+  pool_size: 10
+  max_retries: 3
+
+postgres:
+  # PostgreSQL must have the pgvector extension available because migrations run:
+  # CREATE EXTENSION IF NOT EXISTS vector;
+  dsn: postgres://postgres:268%40KDhrai@172.20.156.41:5438/context?sslmode=disable&search_path=context
+
+llm:
+  api_base: https://dashscope.aliyuncs.com/compatible-mode
+  api_key: sk-51a6303da2b84a108a2f120a17241b73
+  model: qwen3-max
+  max_tokens: 4096
+  temperature: 0.2
+
+embedding:
+  api_base: https://dashscope.aliyuncs.com/compatible-mode
+  api_key: sk-51a6303da2b84a108a2f120a17241b73
+  model: text-embedding-v4
+  dimension: 2048
+
+vector:
+  # Real working backend in the current codebase.
+  backend: pgvector
+
+engine:
+  token_budget: 32000
+  max_messages: 50
+  compact_budget_ratio: 0.5
+  compact_token_threshold: 16000
+  compact_turn_threshold: 10
+  compact_interval_min: 15
+  compact_timeout_sec: 120
+  max_concurrent_compacts: 10
+  recent_raw_turn_count: 8
+  recall_score_threshold: 0.7
+  recall_max_results: 10
+  sync_queue_size: 10000
+  sync_batch_size: 100
+  sync_flush_interval_ms: 500
+  lru_cache_ttl_sec: 5
+  slow_query_ms: 300
+  skill_body_load_threshold: 0.9
+  max_loaded_skill_bodies: 2
+
+log:
+  level: info
+  format: json
+  output: stdout
+  file_path: ""
+  max_size_mb: 100
+  max_backups: 5
+  max_age_days: 7
+  component_levels: {}
+
+migrate:
+  auto_migrate: true

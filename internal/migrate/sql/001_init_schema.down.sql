@@ -1,0 +1,6 @@
+DROP TABLE IF EXISTS user_profiles CASCADE;
+DROP TABLE IF EXISTS memory_facts CASCADE;
+DROP TABLE IF EXISTS compact_checkpoints CASCADE;
+DROP TABLE IF EXISTS session_usage_records CASCADE;
+DROP TABLE IF EXISTS session_messages CASCADE;
+DROP TABLE IF EXISTS sessions CASCADE;
