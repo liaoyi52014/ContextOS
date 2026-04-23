@@ -5,9 +5,11 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	ctxlog "github.com/contextos/contextos/internal/log"
 	"github.com/contextos/contextos/internal/types"
@@ -28,6 +30,10 @@ type CompactConfig struct {
 	CompactTimeoutSec     int     // default 120
 	MaxConcurrentCompacts int     // default 10
 	TokenBudget           int     // total token budget for ratio calculation
+	LLMTimeoutSec         int     // default 60
+	EmbedTimeoutSec       int     // default 30
+	VectorTimeoutSec      int     // default 30
+	RecentRawTurnCount    int     // default 8 — number of recent messages to keep after compact
 }
 
 // DefaultCompactConfig returns a CompactConfig with default values.
@@ -40,6 +46,10 @@ func DefaultCompactConfig() *CompactConfig {
 		CompactTimeoutSec:     120,
 		MaxConcurrentCompacts: 10,
 		TokenBudget:           32000,
+		LLMTimeoutSec:         60,
+		EmbedTimeoutSec:       30,
+		VectorTimeoutSec:      30,
+		RecentRawTurnCount:    8,
 	}
 }
 
@@ -58,6 +68,7 @@ type CompactProcessor struct {
 	config      *CompactConfig
 	semaphore   chan struct{} // global concurrency limiter
 	activeLocks sync.Map      // session_id -> bool, local mutex
+	wg          sync.WaitGroup // tracks active compact goroutines
 	logger      *zap.Logger
 }
 
@@ -153,8 +164,28 @@ func (p *CompactProcessor) EvaluateAndTrigger(ctx context.Context, rc types.Requ
 	}
 
 	// Launch goroutine (non-blocking).
+	p.wg.Add(1)
 	go func() {
-		compactCtx := context.Background()
+		defer func() {
+			p.activeLocks.Delete(session.ID)
+			<-p.semaphore
+			p.wg.Done()
+			if r := recover(); r != nil {
+				p.logger.Error("compact goroutine panicked",
+					zap.String("session_id", session.ID),
+					zap.Any("panic", r),
+				)
+				if taskID != "" && p.tasks != nil {
+					_ = p.tasks.Fail(context.Background(), taskID, fmt.Errorf("panic: %v", r))
+				}
+			}
+		}()
+		overallTimeout := time.Duration(p.config.CompactTimeoutSec) * time.Second
+		if overallTimeout <= 0 {
+			overallTimeout = 120 * time.Second
+		}
+		compactCtx, compactCancel := context.WithTimeout(context.Background(), overallTimeout)
+		defer compactCancel()
 		if taskID != "" && p.tasks != nil {
 			_ = p.tasks.Start(compactCtx, taskID)
 		}
@@ -176,6 +207,21 @@ func (p *CompactProcessor) EvaluateAndTrigger(ctx context.Context, rc types.Requ
 	}()
 
 	return true, taskID, nil
+}
+
+// WaitForCompletion waits for all active compact goroutines to finish, with a timeout.
+func (p *CompactProcessor) WaitForCompletion(timeout time.Duration) error {
+	done := make(chan struct{})
+	go func() {
+		p.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-time.After(timeout):
+		return fmt.Errorf("compact_processor: timed out waiting for %v", timeout)
+	}
 }
 
 // shouldTrigger evaluates the four trigger conditions. Any one triggers compact.
@@ -273,11 +319,6 @@ func (p *CompactProcessor) extractCompactMeta(session *types.Session) compactMet
 // distributed lock -> LLM summary -> extract memories -> embed & store ->
 // merge profile -> log checkpoint -> release lock -> trigger hooks.
 func (p *CompactProcessor) executeCompact(ctx context.Context, rc types.RequestContext, snapshot *types.Session) error {
-	defer func() {
-		p.activeLocks.Delete(snapshot.ID)
-		<-p.semaphore
-	}()
-
 	sessionID := snapshot.ID
 	lockKey := fmt.Sprintf("compact:%s:%s:%s", rc.TenantID, rc.UserID, sessionID)
 	lockTTL := time.Duration(p.config.CompactTimeoutSec) * time.Second
@@ -310,11 +351,28 @@ func (p *CompactProcessor) executeCompact(ctx context.Context, rc types.RequestC
 		zap.Int("message_count", len(snapshot.Messages)),
 	)
 
-	// Build summary prompt from messages.
-	summaryPrompt := buildSummaryPrompt(snapshot.Messages)
+	// Determine where to start summarizing (incremental compaction).
+	sourceTurnStart := 0
+	if snapshot.Metadata != nil {
+		if v, ok := snapshot.Metadata["last_compact_turn"]; ok {
+			sourceTurnStart = toInt(v)
+		}
+	}
+	if sourceTurnStart > len(snapshot.Messages) {
+		sourceTurnStart = 0
+	}
+
+	// Build summary prompt from new messages only.
+	summaryPrompt := buildSummaryPrompt(snapshot.Messages[sourceTurnStart:])
 
 	// Call LLM to generate summary.
-	llmResp, err := p.llm.Complete(ctx, types.LLMRequest{
+	llmTimeout := time.Duration(p.config.LLMTimeoutSec) * time.Second
+	if llmTimeout <= 0 {
+		llmTimeout = 60 * time.Second
+	}
+	llmCtx, llmCancel := context.WithTimeout(ctx, llmTimeout)
+	defer llmCancel()
+	llmResp, err := p.llm.Complete(llmCtx, types.LLMRequest{
 		Messages: []types.Message{
 			{Role: "system", Content: "You are a helpful assistant that summarizes conversations."},
 			{Role: "user", Content: summaryPrompt},
@@ -363,6 +421,28 @@ func (p *CompactProcessor) executeCompact(ctx context.Context, rc types.RequestC
 		)
 	}
 
+	// Replace messages with summary + recent messages.
+	// Save original snapshot message count before replacement for atomic update.
+	originalSnapshotLen := len(snapshot.Messages)
+	recentCount := p.config.RecentRawTurnCount
+	if recentCount <= 0 {
+		recentCount = 8
+	}
+	summaryMsg := types.Message{
+		Role:    "system",
+		Content: "[Compact Summary] " + summaryContent,
+	}
+	var recentMsgs []types.Message
+	if len(snapshot.Messages) > recentCount {
+		recentMsgs = snapshot.Messages[len(snapshot.Messages)-recentCount:]
+	} else {
+		recentMsgs = snapshot.Messages
+	}
+	compactedMessages := make([]types.Message, 0, 1+len(recentMsgs))
+	compactedMessages = append(compactedMessages, summaryMsg)
+	compactedMessages = append(compactedMessages, recentMsgs...)
+	snapshot.Messages = compactedMessages
+
 	// Persist CompactCheckpoint (log for now).
 	checkpoint := types.CompactCheckpoint{
 		ID:                   generateCompactID(),
@@ -370,7 +450,7 @@ func (p *CompactProcessor) executeCompact(ctx context.Context, rc types.RequestC
 		TenantID:             rc.TenantID,
 		UserID:               rc.UserID,
 		CommittedAt:          time.Now(),
-		SourceTurnStart:      0,
+		SourceTurnStart:      sourceTurnStart,
 		SourceTurnEnd:        len(snapshot.Messages),
 		SummaryContent:       summaryContent,
 		ExtractedMemoryIDs:   memoryIDs,
@@ -389,11 +469,43 @@ func (p *CompactProcessor) executeCompact(ctx context.Context, rc types.RequestC
 		snapshot.Metadata = map[string]interface{}{}
 	}
 	snapshot.Metadata["last_compact_at"] = checkpoint.CommittedAt.Format(time.RFC3339)
-	snapshot.Metadata["last_compact_turn"] = len(snapshot.Messages)
-	snapshot.Metadata["last_compact_tokens"] = extractCompactTokenCount(snapshot.Messages)
-	snapshot.UpdatedAt = time.Now()
-	if err := p.sessions.store.Save(ctx, snapshot); err != nil {
-		return fmt.Errorf("compact_processor: update session metadata: %w", err)
+	snapshot.Metadata["last_compact_turn"] = len(compactedMessages)
+	snapshot.Metadata["last_compact_tokens"] = extractCompactTokenCount(compactedMessages)
+
+	// Atomic update: reload the live session to preserve messages added during compact.
+	liveSession, err := p.sessions.store.Load(ctx, rc.TenantID, rc.UserID, sessionID)
+	if err != nil {
+		return fmt.Errorf("compact_processor: reload live session: %w", err)
+	}
+	if liveSession == nil {
+		// Session was deleted during compact; save snapshot as fallback.
+		snapshot.Messages = compactedMessages
+		snapshot.UpdatedAt = time.Now()
+		if err := p.sessions.store.Save(ctx, snapshot); err != nil {
+			return fmt.Errorf("compact_processor: save fallback session: %w", err)
+		}
+	} else {
+		// Calculate messages added during compact.
+		var newMsgsDuringCompact []types.Message
+		if len(liveSession.Messages) > originalSnapshotLen {
+			newMsgsDuringCompact = liveSession.Messages[originalSnapshotLen:]
+		}
+		// Build final messages: compacted + messages added during compact.
+		finalMessages := make([]types.Message, 0, len(compactedMessages)+len(newMsgsDuringCompact))
+		finalMessages = append(finalMessages, compactedMessages...)
+		finalMessages = append(finalMessages, newMsgsDuringCompact...)
+
+		liveSession.Messages = finalMessages
+		if liveSession.Metadata == nil {
+			liveSession.Metadata = map[string]interface{}{}
+		}
+		liveSession.Metadata["last_compact_at"] = snapshot.Metadata["last_compact_at"]
+		liveSession.Metadata["last_compact_turn"] = len(finalMessages)
+		liveSession.Metadata["last_compact_tokens"] = extractCompactTokenCount(finalMessages)
+		liveSession.UpdatedAt = time.Now()
+		if err := p.sessions.store.Save(ctx, liveSession); err != nil {
+			return fmt.Errorf("compact_processor: update session metadata: %w", err)
+		}
 	}
 
 	p.logger.Info("compact checkpoint persisted",
@@ -478,16 +590,131 @@ func buildSummaryPrompt(messages []types.Message) string {
 }
 
 // extractFacts splits summary text into individual fact sentences.
+// It handles structured text (numbered lists, bullet lists, paragraphs)
+// in addition to plain sentence splitting.
 func extractFacts(summary string) []string {
-	// Simple heuristic: split by sentence-ending punctuation.
 	var facts []string
-	for _, sentence := range splitSentences(summary) {
-		trimmed := strings.TrimSpace(sentence)
-		if len(trimmed) > 0 {
-			facts = append(facts, trimmed)
+
+	// Split by paragraphs (double newline or more).
+	paragraphs := splitParagraphs(summary)
+
+	for _, para := range paragraphs {
+		para = strings.TrimSpace(para)
+		if para == "" {
+			continue
+		}
+
+		// Check if paragraph contains list items.
+		lines := strings.Split(para, "\n")
+		var listItems []string
+		hasListItems := false
+
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				continue
+			}
+			if isListItem(trimmed) {
+				hasListItems = true
+				// Strip list prefix.
+				cleaned := stripListPrefix(trimmed)
+				if cleaned != "" {
+					listItems = append(listItems, cleaned)
+				}
+			} else if hasListItems {
+				// Non-list line after list items — could be a header or continuation.
+				// If short, skip (likely a header like "Key findings:").
+				if len(trimmed) > 20 {
+					listItems = append(listItems, trimmed)
+				}
+			} else {
+				// Plain text line — use sentence splitting.
+				for _, sentence := range splitSentences(trimmed) {
+					s := strings.TrimSpace(sentence)
+					if s != "" {
+						listItems = append(listItems, s)
+					}
+				}
+			}
+		}
+
+		if hasListItems {
+			facts = append(facts, listItems...)
+		} else {
+			// No list items — use sentence splitting on the whole paragraph.
+			for _, sentence := range splitSentences(para) {
+				s := strings.TrimSpace(sentence)
+				if s != "" {
+					facts = append(facts, s)
+				}
+			}
 		}
 	}
+
 	return facts
+}
+
+// splitParagraphs splits text on double newlines.
+func splitParagraphs(text string) []string {
+	parts := strings.Split(text, "\n\n")
+	var result []string
+	for _, p := range parts {
+		if strings.TrimSpace(p) != "" {
+			result = append(result, p)
+		}
+	}
+	if len(result) == 0 && strings.TrimSpace(text) != "" {
+		result = []string{text}
+	}
+	return result
+}
+
+// isListItem returns true if the line starts with a numbered or bullet list prefix.
+func isListItem(line string) bool {
+	if len(line) < 2 {
+		return false
+	}
+	// Check numbered list: "1. ", "1) ", "2. ", etc.
+	for i, r := range line {
+		if r >= '0' && r <= '9' {
+			continue
+		}
+		if i > 0 && (r == '.' || r == ')') && i+1 < len(line) && line[i+1] == ' ' {
+			return true
+		}
+		break
+	}
+	// Check bullet list: "- ", "* ", "• "
+	if (line[0] == '-' || line[0] == '*') && len(line) > 1 && line[1] == ' ' {
+		return true
+	}
+	if strings.HasPrefix(line, "• ") {
+		return true
+	}
+	return false
+}
+
+// stripListPrefix removes the numbered or bullet prefix from a list item line.
+func stripListPrefix(line string) string {
+	// Strip "1. ", "1) ", etc.
+	for i, r := range line {
+		if r >= '0' && r <= '9' {
+			continue
+		}
+		if i > 0 && (r == '.' || r == ')') {
+			return strings.TrimSpace(line[i+1:])
+		}
+		break
+	}
+	// Strip "- ", "* "
+	if strings.HasPrefix(line, "- ") || strings.HasPrefix(line, "* ") {
+		return strings.TrimSpace(line[2:])
+	}
+	// Strip "• "
+	if strings.HasPrefix(line, "• ") {
+		return strings.TrimSpace(line[len("• "):])
+	}
+	return line
 }
 
 // splitSentences splits text into sentences by common delimiters.
@@ -519,7 +746,13 @@ func (p *CompactProcessor) embedAndStoreFacts(
 	snapshot *types.Session,
 	facts []string,
 ) ([]string, error) {
-	vectors, err := p.embedding.Embed(ctx, facts)
+	embedTimeout := time.Duration(p.config.EmbedTimeoutSec) * time.Second
+	if embedTimeout <= 0 {
+		embedTimeout = 30 * time.Second
+	}
+	embedCtx, embedCancel := context.WithTimeout(ctx, embedTimeout)
+	defer embedCancel()
+	vectors, err := p.embedding.Embed(embedCtx, facts)
 	if err != nil {
 		return nil, fmt.Errorf("embed facts: %w", err)
 	}
@@ -544,7 +777,13 @@ func (p *CompactProcessor) embedAndStoreFacts(
 		}
 	}
 
-	if err := p.vectorStore.Upsert(ctx, items); err != nil {
+	vectorTimeout := time.Duration(p.config.VectorTimeoutSec) * time.Second
+	if vectorTimeout <= 0 {
+		vectorTimeout = 30 * time.Second
+	}
+	vectorCtx, vectorCancel := context.WithTimeout(ctx, vectorTimeout)
+	defer vectorCancel()
+	if err := p.vectorStore.Upsert(vectorCtx, items); err != nil {
 		return nil, fmt.Errorf("upsert facts: %w", err)
 	}
 
@@ -582,18 +821,20 @@ func (p *CompactProcessor) mergeProfile(
 	}
 
 	// Append new insights from conversation summary.
-	existing.Summary = summary
+	existing.Summary = mergeSummaries(existing.Summary, summary)
 	existing.SourceSessionID = snapshot.ID
 	existing.UpdatedAt = time.Now()
 
 	// Extract simple preferences/interests from facts in the summary.
 	facts := extractFacts(summary)
 	for _, fact := range facts {
-		lower := strings.ToLower(fact)
-		if strings.Contains(lower, "prefer") || strings.Contains(lower, "like") {
+		if isPositivePreference(fact) {
 			existing.Preferences = appendUnique(existing.Preferences, fact)
-		} else if strings.Contains(lower, "interest") || strings.Contains(lower, "curious") {
-			existing.Interests = appendUnique(existing.Interests, fact)
+		} else {
+			lower := strings.ToLower(fact)
+			if strings.Contains(lower, "interest") || strings.Contains(lower, "curious") {
+				existing.Interests = appendUnique(existing.Interests, fact)
+			}
 		}
 	}
 
@@ -613,6 +854,51 @@ func appendUnique(slice []string, val string) []string {
 		}
 	}
 	return append(slice, val)
+}
+
+// mergeSummaries merges old and new summaries instead of overwriting.
+// If old is non-empty, concatenates with a separator. If the merged result
+// exceeds 4000 runes, the old part is truncated to keep the most recent content.
+func mergeSummaries(old, new string) string {
+	if old == "" {
+		return new
+	}
+	merged := old + "\n\n---\n\n" + new
+	if utf8.RuneCountInString(merged) <= 4000 {
+		return merged
+	}
+	// Truncate old part to fit within 4000 runes total.
+	separator := "\n\n---\n\n"
+	separatorRunes := utf8.RuneCountInString(separator)
+	newRunes := utf8.RuneCountInString(new)
+	maxOldRunes := 4000 - separatorRunes - newRunes
+	if maxOldRunes <= 0 {
+		// New summary alone is too large or barely fits; just return new.
+		return new
+	}
+	oldRunes := []rune(old)
+	if len(oldRunes) > maxOldRunes {
+		oldRunes = oldRunes[len(oldRunes)-maxOldRunes:]
+	}
+	return string(oldRunes) + separator + new
+}
+
+// isPositivePreference checks whether a fact expresses a positive preference.
+// It returns false for negations ("don't like", "not prefer", etc.) and
+// false matches ("likewise", "likely").
+func isPositivePreference(fact string) bool {
+	lower := strings.ToLower(fact)
+	// Check for negation words — if found, this is not a positive preference.
+	negations := []string{"don't", "doesn't", "not ", "never ", "no longer", "dislike"}
+	for _, neg := range negations {
+		if strings.Contains(lower, neg) {
+			return false
+		}
+	}
+	// Use word-boundary regex to avoid false matches like "likewise", "likely".
+	preferRe := regexp.MustCompile(`\bprefer(s|red|ence)?\b`)
+	likeRe := regexp.MustCompile(`\blike(s|d)?\b`)
+	return preferRe.MatchString(lower) || likeRe.MatchString(lower)
 }
 
 func extractCompactTokenCount(messages []types.Message) int {

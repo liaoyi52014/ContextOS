@@ -26,6 +26,10 @@ func (s *Server) handleAssemble(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": types.ErrBadRequest, "message": "query is required"})
 		return
 	}
+	if req.TokenBudget < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"code": types.ErrBadRequest, "message": "token_budget must be non-negative"})
+		return
+	}
 
 	rc := GetRequestContext(c)
 	if req.SessionID != "" {
@@ -74,6 +78,10 @@ func (s *Server) handleIngest(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": types.ErrBadRequest, "message": "messages is required"})
 		return
 	}
+	if len(req.Messages) > 200 {
+		c.JSON(http.StatusBadRequest, gin.H{"code": types.ErrBadRequest, "message": "messages exceeds maximum of 200"})
+		return
+	}
 
 	rc := GetRequestContext(c)
 	if req.SessionID != "" {
@@ -107,6 +115,10 @@ func (s *Server) handleMemorySearch(c *gin.Context) {
 	}
 	if req.Query == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"code": types.ErrBadRequest, "message": "query is required"})
+		return
+	}
+	if req.Limit < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"code": types.ErrBadRequest, "message": "limit must be non-negative"})
 		return
 	}
 

@@ -112,6 +112,9 @@ type EngineConfig struct {
 	SlowQueryMs             int     `json:"slow_query_ms" yaml:"slow_query_ms" mapstructure:"slow_query_ms"`
 	SkillBodyLoadThreshold  float64 `json:"skill_body_load_threshold" yaml:"skill_body_load_threshold" mapstructure:"skill_body_load_threshold"`
 	MaxLoadedSkillBodies    int     `json:"max_loaded_skill_bodies" yaml:"max_loaded_skill_bodies" mapstructure:"max_loaded_skill_bodies"`
+	LLMTimeoutSec           int     `json:"llm_timeout_sec" yaml:"llm_timeout_sec" mapstructure:"llm_timeout_sec"`
+	EmbedTimeoutSec         int     `json:"embed_timeout_sec" yaml:"embed_timeout_sec" mapstructure:"embed_timeout_sec"`
+	VectorTimeoutSec        int     `json:"vector_timeout_sec" yaml:"vector_timeout_sec" mapstructure:"vector_timeout_sec"`
 }
 
 // LogConfig holds logging settings.
@@ -166,6 +169,9 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("engine.slow_query_ms", 300)
 	v.SetDefault("engine.skill_body_load_threshold", 0.9)
 	v.SetDefault("engine.max_loaded_skill_bodies", 2)
+	v.SetDefault("engine.llm_timeout_sec", 60)
+	v.SetDefault("engine.embed_timeout_sec", 30)
+	v.SetDefault("engine.vector_timeout_sec", 30)
 
 	// migrate
 	v.SetDefault("migrate.auto_migrate", true)

@@ -43,13 +43,37 @@ func NewRetrievalEngine(vs types.VectorStore, emb types.EmbeddingProvider, cfg R
 	}
 }
 
-// estimateTokens provides a rough token estimate for a string (~4 chars per token).
+// estimateTokens provides a rough token estimate for a string.
+// ASCII characters use ~4 chars/token; CJK characters use ~1.5 chars/token.
 func estimateTokens(s string) int {
-	n := len(s) / 4
-	if n == 0 && len(s) > 0 {
-		n = 1
+	if len(s) == 0 {
+		return 0
 	}
-	return n
+	asciiChars := 0
+	cjkChars := 0
+	for _, r := range s {
+		if r <= 127 {
+			asciiChars++
+		} else if isCJK(r) {
+			cjkChars++
+		} else {
+			asciiChars++
+		}
+	}
+	tokens := asciiChars/4 + cjkChars
+	if tokens == 0 && len(s) > 0 {
+		tokens = 1
+	}
+	return tokens
+}
+
+// isCJK returns true if the rune is in a CJK Unicode range.
+func isCJK(r rune) bool {
+	return (r >= 0x4E00 && r <= 0x9FFF) || // CJK Unified Ideographs
+		(r >= 0x3400 && r <= 0x4DBF) || // CJK Extension A
+		(r >= 0x3040 && r <= 0x309F) || // Hiragana
+		(r >= 0x30A0 && r <= 0x30FF) || // Katakana
+		(r >= 0xAC00 && r <= 0xD7AF) // Hangul
 }
 
 // SemanticSearch embeds the query, searches the vector store with tenant+user filtering,
@@ -100,11 +124,9 @@ func (r *RetrievalEngine) SemanticSearch(ctx context.Context, rc types.RequestCo
 			break
 		}
 		if tokens > remaining {
-			// Truncate content to fit budget.
+			// Truncate content to fit budget (rune-safe).
 			maxChars := remaining * 4
-			if maxChars < len(content) {
-				content = content[:maxChars]
-			}
+			content = truncateRunes(content, maxChars)
 			tokens = remaining
 		}
 
@@ -163,9 +185,7 @@ func (r *RetrievalEngine) PatternSearch(ctx context.Context, rc types.RequestCon
 		}
 		if tokens > remaining {
 			maxChars := remaining * 4
-			if maxChars < len(content) {
-				content = content[:maxChars]
-			}
+			content = truncateRunes(content, maxChars)
 			tokens = remaining
 		}
 
@@ -322,21 +342,24 @@ func (r *RetrievalEngine) BatchLoadContent(ctx context.Context, ids []string, le
 	return blocks, nil
 }
 
+// truncateRunes truncates a string to at most maxRunes runes, preserving valid UTF-8.
+func truncateRunes(s string, maxRunes int) string {
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes])
+}
+
 // applyContentLevel truncates content based on the requested level.
 func applyContentLevel(content string, level types.ContentLevel) string {
 	switch level {
 	case types.ContentL0:
-		// L0: summary — first 200 chars.
-		if len(content) > 200 {
-			return content[:200]
-		}
-		return content
+		// L0: summary — first 200 runes.
+		return truncateRunes(content, 200)
 	case types.ContentL1:
-		// L1: overview — first 1000 chars.
-		if len(content) > 1000 {
-			return content[:1000]
-		}
-		return content
+		// L1: overview — first 1000 runes.
+		return truncateRunes(content, 1000)
 	default:
 		// L2: full content.
 		return content

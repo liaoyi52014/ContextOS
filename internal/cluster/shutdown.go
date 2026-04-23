@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"sync"
+	"time"
 )
 
 // GracefulShutdown coordinates orderly shutdown of server components:
@@ -13,6 +14,7 @@ type GracefulShutdown struct {
 	httpServer     *http.Server
 	syncQueueStop  func()
 	compactFlush   func()
+	compactWait    func(time.Duration) error
 }
 
 // NewGracefulShutdown creates a new GracefulShutdown coordinator.
@@ -41,15 +43,25 @@ func (gs *GracefulShutdown) RegisterCompactFlush(flush func()) {
 	gs.compactFlush = flush
 }
 
+// RegisterCompactWait registers a wait function that blocks until all active
+// compact goroutines complete or the timeout expires.
+func (gs *GracefulShutdown) RegisterCompactWait(wait func(time.Duration) error) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.compactWait = wait
+}
+
 // Shutdown performs an orderly shutdown:
 // 1. Stop accepting new HTTP requests
-// 2. Flush compact processor buffers
-// 3. Stop the sync queue
+// 2. Wait for active compact goroutines to complete
+// 3. Flush compact processor buffers
+// 4. Stop the sync queue
 func (gs *GracefulShutdown) Shutdown(ctx context.Context) error {
 	gs.mu.Lock()
 	srv := gs.httpServer
 	syncStop := gs.syncQueueStop
 	flush := gs.compactFlush
+	wait := gs.compactWait
 	gs.mu.Unlock()
 
 	// Step 1: Stop accepting new requests.
@@ -59,12 +71,27 @@ func (gs *GracefulShutdown) Shutdown(ctx context.Context) error {
 		}
 	}
 
-	// Step 2: Flush compact processor buffers.
+	// Step 2: Wait for active compact goroutines to complete.
+	if wait != nil {
+		timeout := 30 * time.Second
+		if deadline, ok := ctx.Deadline(); ok {
+			remaining := time.Until(deadline)
+			if remaining > 0 {
+				timeout = remaining
+			}
+		}
+		if err := wait(timeout); err != nil {
+			// Log but don't fail shutdown — continue with cleanup.
+			_ = err
+		}
+	}
+
+	// Step 3: Flush compact processor buffers.
 	if flush != nil {
 		flush()
 	}
 
-	// Step 3: Stop the sync queue (drains pending items).
+	// Step 4: Stop the sync queue (drains pending items).
 	if syncStop != nil {
 		syncStop()
 	}

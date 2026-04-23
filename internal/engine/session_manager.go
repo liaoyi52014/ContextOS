@@ -158,12 +158,13 @@ func (m *SessionManager) AddMessage(ctx context.Context, session *types.Session,
 		session.Messages = session.Messages[len(session.Messages)-session.MaxMessages:]
 	}
 	session.UpdatedAt = time.Now()
+	cloned := cloneSession(session) // deep copy inside lock
 	m.mu.Unlock()
 
 	key := m.cacheKey(session.TenantID, session.UserID, session.ID)
-	m.putLRU(key, session)
+	m.putLRU(key, cloned) // use clone
 
-	if err := m.putRedis(ctx, key, session); err != nil {
+	if err := m.putRedis(ctx, key, cloned); err != nil { // use clone
 		return fmt.Errorf("session_manager: redis write: %w", err)
 	}
 
@@ -199,12 +200,13 @@ func (m *SessionManager) RecordUsage(ctx context.Context, session *types.Session
 		}
 	}
 	session.UpdatedAt = time.Now()
+	cloned := cloneSession(session) // deep copy inside lock
 	m.mu.Unlock()
 
 	key := m.cacheKey(session.TenantID, session.UserID, session.ID)
-	m.putLRU(key, session)
+	m.putLRU(key, cloned) // use clone
 
-	if err := m.putRedis(ctx, key, session); err != nil {
+	if err := m.putRedis(ctx, key, cloned); err != nil { // use clone
 		return fmt.Errorf("session_manager: redis write usage: %w", err)
 	}
 
@@ -213,7 +215,7 @@ func (m *SessionManager) RecordUsage(ctx context.Context, session *types.Session
 		SessionID:    session.ID,
 		TenantID:     session.TenantID,
 		UserID:       session.UserID,
-		Session:      cloneSession(session),
+		Session:      cloned, // use clone
 		UsageRecords: cloneUsageRecords(records),
 		EnqueueAt:    time.Now(),
 	}

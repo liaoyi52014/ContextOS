@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/contextos/contextos/internal/types"
@@ -17,17 +18,22 @@ type SyncItem struct {
 	Session      *types.Session
 	UsageRecords []types.UsageRecord
 	EnqueueAt    time.Time
+	RetryCount   int
 }
 
 // SyncQueue batches session writes and flushes them to PostgreSQL asynchronously.
 type SyncQueue struct {
-	ch            chan *SyncItem
-	batchSize     int
-	flushInterval time.Duration
-	dlq           chan *SyncItem
-	store         types.SessionStore
-	done          chan struct{}
-	stopped       chan struct{}
+	ch               chan *SyncItem
+	batchSize        int
+	flushInterval    time.Duration
+	dlq              chan *SyncItem
+	store            types.SessionStore
+	done             chan struct{}
+	stopped          chan struct{}
+	dlqDone          chan struct{}
+	dlqStopped       chan struct{}
+	maxDLQRetries    int
+	dlqRetryInterval time.Duration
 }
 
 // NewSyncQueue creates a SyncQueue with the given parameters.
@@ -42,18 +48,29 @@ func NewSyncQueue(store types.SessionStore, size, batchSize int, flushInterval t
 		flushInterval = 500 * time.Millisecond
 	}
 	return &SyncQueue{
-		ch:            make(chan *SyncItem, size),
-		batchSize:     batchSize,
-		flushInterval: flushInterval,
-		dlq:           make(chan *SyncItem, size),
-		store:         store,
-		done:          make(chan struct{}),
-		stopped:       make(chan struct{}),
+		ch:               make(chan *SyncItem, size),
+		batchSize:        batchSize,
+		flushInterval:    flushInterval,
+		dlq:              make(chan *SyncItem, size),
+		store:            store,
+		done:             make(chan struct{}),
+		stopped:          make(chan struct{}),
+		dlqDone:          make(chan struct{}),
+		dlqStopped:       make(chan struct{}),
+		maxDLQRetries:    3,
+		dlqRetryInterval: 30 * time.Second,
 	}
 }
 
 // Enqueue sends an item to the sync queue. Blocks if the queue is full (backpressure).
 func (q *SyncQueue) Enqueue(item *SyncItem) error {
+	// Check if stopped first to avoid non-deterministic select behavior
+	// when both ch (buffered with capacity) and done are ready.
+	select {
+	case <-q.done:
+		return fmt.Errorf("sync_queue: queue is stopped")
+	default:
+	}
 	select {
 	case q.ch <- item:
 		return nil
@@ -65,17 +82,30 @@ func (q *SyncQueue) Enqueue(item *SyncItem) error {
 // Start launches the background worker goroutine that collects and flushes batches.
 func (q *SyncQueue) Start() {
 	go q.worker()
+	go q.dlqWorker()
 }
 
 // Stop signals the worker to stop and waits for it to flush remaining items.
 func (q *SyncQueue) Stop() {
 	close(q.done)
 	<-q.stopped
+	close(q.dlqDone)
+	<-q.dlqStopped
 }
 
 // DLQLen returns the number of items in the dead letter queue.
 func (q *SyncQueue) DLQLen() int {
 	return len(q.dlq)
+}
+
+// SetDLQRetryInterval overrides the DLQ retry interval. Must be called before Start().
+func (q *SyncQueue) SetDLQRetryInterval(d time.Duration) {
+	q.dlqRetryInterval = d
+}
+
+// SetMaxDLQRetries overrides the maximum DLQ retry count. Must be called before Start().
+func (q *SyncQueue) SetMaxDLQRetries(n int) {
+	q.maxDLQRetries = n
 }
 
 func (q *SyncQueue) worker() {
@@ -133,8 +163,56 @@ func (q *SyncQueue) flush(batch []*SyncItem) {
 			select {
 			case q.dlq <- item:
 			default:
-				// DLQ full, item is dropped. In production this would be logged.
+				// DLQ full, item is dropped.
+				log.Printf("WARN sync_queue: DLQ full, dropping item session_id=%s tenant_id=%s", item.SessionID, item.TenantID)
 			}
+		}
+	}
+}
+
+// dlqWorker periodically drains the DLQ and retries failed items.
+func (q *SyncQueue) dlqWorker() {
+	defer close(q.dlqStopped)
+
+	ticker := time.NewTicker(q.dlqRetryInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			q.drainDLQ()
+		case <-q.dlqDone:
+			// Final drain attempt before exiting.
+			q.drainDLQ()
+			return
+		}
+	}
+}
+
+// drainDLQ performs a non-blocking drain of available DLQ items and retries them.
+func (q *SyncQueue) drainDLQ() {
+	ctx := context.Background()
+	for {
+		select {
+		case item := <-q.dlq:
+			item.RetryCount++
+			if item.RetryCount > q.maxDLQRetries {
+				log.Printf("WARN sync_queue: discarding item after %d DLQ retries session_id=%s tenant_id=%s",
+					item.RetryCount, item.SessionID, item.TenantID)
+				continue
+			}
+			if err := q.persistItem(ctx, item); err != nil {
+				// Retry failed, put back in DLQ if space available.
+				select {
+				case q.dlq <- item:
+				default:
+					log.Printf("WARN sync_queue: DLQ full on re-enqueue, discarding item session_id=%s tenant_id=%s retry=%d",
+						item.SessionID, item.TenantID, item.RetryCount)
+				}
+			}
+		default:
+			// DLQ drained, nothing left to process.
+			return
 		}
 	}
 }

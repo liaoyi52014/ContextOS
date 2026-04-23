@@ -84,7 +84,6 @@ func (b *ContextBuilder) Assemble(ctx context.Context, rc types.RequestContext, 
 	// ── Phase 1: Parallel fetch ──
 	var (
 		profile  *types.UserProfile
-		memories []types.ContentBlock
 		session  *types.Session
 		catalog  []types.SkillMeta
 	)
@@ -104,21 +103,7 @@ func (b *ContextBuilder) Assemble(ctx context.Context, rc types.RequestContext, 
 		return nil
 	})
 
-	// 2. Semantic search memories
-	g.Go(func() error {
-		if b.retrieval == nil || b.embedding == nil || b.vectorStore == nil {
-			return nil
-		}
-		memBudget := budget / 4
-		blocks, err := b.retrieval.SemanticSearch(gctx, rc, req.Query, memBudget)
-		if err != nil {
-			return fmt.Errorf("context_builder: semantic search: %w", err)
-		}
-		memories = blocks
-		return nil
-	})
-
-	// 3. Load session history
+	// 2. Load session history
 	g.Go(func() error {
 		sess, err := b.sessions.GetOrCreate(gctx, rc)
 		if err != nil {
@@ -128,7 +113,7 @@ func (b *ContextBuilder) Assemble(ctx context.Context, rc types.RequestContext, 
 		return nil
 	})
 
-	// 4. Load Skill catalog
+	// 3. Load Skill catalog
 	g.Go(func() error {
 		if b.skills == nil {
 			return nil
@@ -143,6 +128,36 @@ func (b *ContextBuilder) Assemble(ctx context.Context, rc types.RequestContext, 
 
 	if err := g.Wait(); err != nil {
 		return nil, err
+	}
+
+	// Dynamic memory budget based on session history length.
+	historyLen := 0
+	if session != nil {
+		historyLen = len(session.Messages)
+	}
+	memRatio := 0.25
+	if historyLen <= 3 {
+		memRatio = 0.4
+	}
+	if historyLen > 10 {
+		memRatio = 0.15
+	}
+	memBudget := int(float64(budget) * memRatio)
+	if memBudget < budget/10 {
+		memBudget = budget / 10
+	}
+	if memBudget > budget/2 {
+		memBudget = budget / 2
+	}
+
+	// Semantic search memories (after Phase 1, using dynamic budget).
+	var memories []types.ContentBlock
+	if b.retrieval != nil && b.embedding != nil && b.vectorStore != nil {
+		blocks, err := b.retrieval.SemanticSearch(ctx, rc, req.Query, memBudget)
+		if err != nil {
+			return nil, fmt.Errorf("context_builder: semantic search: %w", err)
+		}
+		memories = blocks
 	}
 
 	// ── Phase 2: Serial assembly ──
@@ -216,8 +231,11 @@ func (b *ContextBuilder) Assemble(ctx context.Context, rc types.RequestContext, 
 	usedTokens := 0
 	for _, blk := range blocks {
 		if usedTokens+blk.Tokens > budget {
-			// Try to fit a demoted version
-			if blk.Level == types.ContentL2 && blk.Tokens > 0 {
+			remaining := budget - usedTokens
+			if remaining < 50 {
+				continue
+			}
+			if blk.Level == types.ContentL2 {
 				// Demote to L1
 				demoted := demoteBlock(blk, types.ContentL1)
 				if usedTokens+demoted.Tokens <= budget {
@@ -233,7 +251,12 @@ func (b *ContextBuilder) Assemble(ctx context.Context, rc types.RequestContext, 
 					continue
 				}
 			}
-			// Skip block entirely if it doesn't fit
+			// For all levels: truncate to fit remaining budget.
+			truncated := truncateBlockToBudget(blk, remaining)
+			if truncated.Tokens > 0 {
+				finalBlocks = append(finalBlocks, truncated)
+				usedTokens += truncated.Tokens
+			}
 			continue
 		}
 		finalBlocks = append(finalBlocks, blk)
@@ -299,7 +322,20 @@ func (b *ContextBuilder) matchAndLoadSkills(
 	}
 	var hits []skillHit
 
+	// Batch embed all skill texts in a single call.
+	var allSkillTexts []string
 	for _, skill := range catalog {
+		allSkillTexts = append(allSkillTexts, skill.Name+" "+skill.Description)
+	}
+	var allSkillVecs [][]float32
+	if len(queryEmbedding) > 0 && b.embedding != nil {
+		vecs, err := b.embedding.Embed(ctx, allSkillTexts)
+		if err == nil {
+			allSkillVecs = vecs
+		}
+	}
+
+	for i, skill := range catalog {
 		// exact_name_hit: 1.0 if skill name appears in query or recent messages
 		exactNameHit := 0.0
 		if strings.Contains(matchInputLower, strings.ToLower(skill.Name)) {
@@ -312,16 +348,10 @@ func (b *ContextBuilder) matchAndLoadSkills(
 
 		// semantic_hit: cosine similarity between query embedding and skill catalog embedding
 		semanticHit := 0.0
-		if len(queryEmbedding) > 0 {
-			// Use embedding provider to compute skill description embedding at runtime
-			// since we don't have pre-computed catalog_embedding in SkillMeta struct
-			skillText := skill.Name + " " + skill.Description
-			skillVecs, err := b.embedding.Embed(ctx, []string{skillText})
-			if err == nil && len(skillVecs) > 0 {
-				semanticHit = cosineSim(queryEmbedding, skillVecs[0])
-				if semanticHit < 0 {
-					semanticHit = 0
-				}
+		if len(queryEmbedding) > 0 && i < len(allSkillVecs) && len(allSkillVecs[i]) > 0 {
+			semanticHit = cosineSim(queryEmbedding, allSkillVecs[i])
+			if semanticHit < 0 {
+				semanticHit = 0
 			}
 		}
 
@@ -474,17 +504,27 @@ func demoteBlock(blk types.ContentBlock, level types.ContentLevel) types.Content
 	content := blk.Content
 	switch level {
 	case types.ContentL0:
-		if len(content) > 200 {
-			content = content[:200]
-		}
+		content = truncateRunes(content, 200)
 	case types.ContentL1:
-		if len(content) > 1000 {
-			content = content[:1000]
-		}
+		content = truncateRunes(content, 1000)
 	}
 	return types.ContentBlock{
 		URI:     blk.URI,
 		Level:   level,
+		Content: content,
+		Source:  blk.Source,
+		Score:   blk.Score,
+		Tokens:  estimateTokens(content),
+	}
+}
+
+// truncateBlockToBudget truncates a block's content to fit within the remaining token budget.
+func truncateBlockToBudget(blk types.ContentBlock, remainingTokens int) types.ContentBlock {
+	maxRunes := remainingTokens * 4
+	content := truncateRunes(blk.Content, maxRunes)
+	return types.ContentBlock{
+		URI:     blk.URI,
+		Level:   blk.Level,
 		Content: content,
 		Source:  blk.Source,
 		Score:   blk.Score,
@@ -509,6 +549,19 @@ func buildSystemPrompt(blocks []types.ContentBlock) string {
 	return strings.Join(parts, "\n\n")
 }
 
+// parseRoleContent extracts the role and content from a "[role]: content" formatted string.
+func parseRoleContent(s string) (string, string) {
+	if strings.HasPrefix(s, "[") {
+		if idx := strings.Index(s, "]: "); idx > 0 {
+			role := s[1:idx]
+			if role == "user" || role == "assistant" || role == "system" {
+				return role, s[idx+3:]
+			}
+		}
+	}
+	return "user", s
+}
+
 // buildMessages constructs the messages array from history content blocks.
 func buildMessages(blocks []types.ContentBlock) []types.Message {
 	var msgs []types.Message
@@ -516,9 +569,10 @@ func buildMessages(blocks []types.ContentBlock) []types.Message {
 		if blk.Source != "history" {
 			continue
 		}
+		role, content := parseRoleContent(blk.Content)
 		msgs = append(msgs, types.Message{
-			Role:    "user",
-			Content: blk.Content,
+			Role:    role,
+			Content: content,
 		})
 	}
 	return msgs
